@@ -1,0 +1,701 @@
+{
+  "name": "Teams Chatbot - Main Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "teams-notification",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-1",
+      "name": "HTTP Trigger - Graph API Notification",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "teams-graph-notification",
+      "notes": "Receives webhook notifications from Microsoft Graph API when a new message is created. This is triggered by Graph API subscription."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate Graph API notification and extract resource data\nconst notification = $input.item.json;\n\n// Graph API sends notifications with validation tokens\nif (notification.validationTokens && notification.validationTokens.length > 0) {\n  // This is a validation request from Graph API\n  // Return the validation token to confirm subscription\n  return {\n    json: {\n      validationToken: notification.validationTokens[0],\n      isValidation: true\n    }\n  };\n}\n\n// Extract notification data\nconst notifications = notification.value || [];\nif (notifications.length === 0) {\n  return null;\n}\n\n// Get the first notification (usually only one)\nconst notificationData = notifications[0];\nconst resource = notificationData.resource || '';\nconst changeType = notificationData.changeType || '';\n\n// Only process 'created' events\nif (changeType !== 'created') {\n  return null;\n}\n\n// Extract message ID from resource URL\n// Format: /teams/{teamId}/channels/{channelId}/messages/{messageId}\nconst resourceMatch = resource.match(/\\/messages\\/([^\\/]+)/);\nif (!resourceMatch) {\n  return null;\n}\n\nconst messageId = resourceMatch[1];\n\n// Extract team and channel IDs\nconst teamMatch = resource.match(/\\/teams\\/([^\\/]+)/);\nconst channelMatch = resource.match(/\\/channels\\/([^\\/]+)/);\n\nreturn {\n  json: {\n    resource,\n    messageId,\n    teamId: teamMatch ? teamMatch[1] : null,\n    channelId: channelMatch ? channelMatch[1] : null,\n    changeType,\n    subscriptionId: notificationData.subscriptionId,\n    isValidation: false\n  }\n};"
+      },
+      "id": "node-1-validate",
+      "name": "Validate & Extract Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300],
+      "notes": "Validates Graph API notification, handles validation tokens, and extracts message/team/channel IDs from notification resource."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.isValidation }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node-1-check",
+      "name": "Check Validation Request",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "notes": "Branches: if validation request, return validation token; otherwise continue to fetch message."
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/plain"
+              }
+            ]
+          },
+          "responseBody": "={{ $json.validationToken }}"
+        }
+      },
+      "id": "node-1-response",
+      "name": "Return Validation Token",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [850, 200],
+      "notes": "Returns validation token to Graph API to confirm webhook subscription."
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.microsoft.com/v1.0{{ $json.resource }}?$expand=mentions",
+        "authentication": "oAuth2",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-1-fetch",
+      "name": "Fetch Message from Graph API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [850, 400],
+      "credentials": {
+        "microsoftOAuth2Api": {
+          "id": "microsoft-graph-api",
+          "name": "Microsoft Graph API"
+        }
+      },
+      "notes": "Fetches the actual message content from Graph API using the resource URL from notification. Expands mentions to get full mention details."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node 2: Mention Detection & Preprocessing (Graph API format)\nconst messageData = $input.item.json;\n\n// Extract bot ID from environment or config\nconst botId = $env.TEAMS_BOT_ID || $env.MICROSOFT_APP_ID || 'your-bot-id';\n\n// Graph API message format\nconst mentions = messageData.mentions || [];\n\n// Check if bot is mentioned\n// Graph API mentions format: { id, mentionText, mentioned: { id, displayName } }\nconst isBotMentioned = mentions.some(mention => {\n  const mentionedId = mention.mentioned?.id || mention.id;\n  return mentionedId === botId || mentionedId?.toLowerCase() === botId.toLowerCase();\n});\n\nif (!isBotMentioned) {\n  // Bot not mentioned, exit workflow\n  return null;\n}\n\n// Extract user information from Graph API format\nconst from = messageData.from || {};\nconst userId = from.user?.id || from.application?.id || messageData.from?.id;\nconst userName = from.user?.displayName || from.application?.displayName || 'Unknown User';\n\n// Extract message content and remove mention tags\nlet plainText = messageData.body?.content || messageData.body?.text || '';\n\n// Remove HTML mention tags: <at id=\"...\">name</at>\nplainText = plainText.replace(/<at[^>]*>.*?<\\/at>/gi, '').trim();\n// Remove other HTML tags if present\nplainText = plainText.replace(/<[^>]+>/g, '').trim();\n// Decode HTML entities\nplainText = plainText.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"');\n\n// Check if this is a reply\nconst hasReply = !!(messageData.replyToId || messageData.inReplyTo?.id);\nconst replyToId = messageData.replyToId || messageData.inReplyTo?.id;\n\n// Extract conversation/thread info\nconst conversationId = messageData.chatId || messageData.conversationId || messageData.conversation?.id;\nconst messageId = messageData.id || messageData.messageId;\n\n// Extract channel and team info\nconst channelId = messageData.channelIdentity?.channelId || messageData.channelId;\nconst teamId = messageData.channelIdentity?.teamId || messageData.teamId;\n\n// Prepare output\nreturn {\n  json: {\n    userId,\n    userName,\n    plainText,\n    hasReply,\n    replyToId,\n    conversationId,\n    messageId,\n    channelId,\n    teamId,\n    originalMessage: messageData,\n    botId\n  }\n};"
+      },
+      "id": "node-2",
+      "name": "Detect Mention & Preprocess",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300],
+      "notes": "Checks if bot is mentioned in Graph API message format. If not, workflow stops. Extracts user info, cleans message text, and identifies if message is a reply."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.hasReply }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node-3-check",
+      "name": "Check Has Reply",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "notes": "Branches workflow: if message is a reply, fetch original message context."
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.microsoft.com/v1.0/teams/{{ $json.teamId }}/channels/{{ $json.channelId }}/messages/{{ $json.replyToId }}",
+        "authentication": "oAuth2",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-3",
+      "name": "Get Reply Context (Graph API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1250, 200],
+      "credentials": {
+        "microsoftOAuth2Api": {
+          "id": "microsoft-graph-api",
+          "name": "Microsoft Graph API"
+        }
+      },
+      "notes": "Fetches the original message content that was replied to. Only executes if hasReply is true. Uses teamId and channelId from Graph API message format."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build context text from reply and current message\nconst currentData = $input.item.json;\nconst replyData = $('Get Reply Context (Graph API)').item?.json;\n\nlet contextText;\n\nif (replyData && currentData.hasReply) {\n  // Extract original message content\n  let originalContent = replyData.body?.content || replyData.text || '';\n  // Clean HTML tags\n  originalContent = originalContent.replace(/<[^>]+>/g, '').trim();\n  \n  contextText = `Original message:\n${originalContent}\n\n---\n\nUser question:\n${currentData.plainText}`;\n} else {\n  contextText = currentData.plainText;\n}\n\nreturn {\n  json: {\n    ...currentData,\n    contextText,\n    originalMessageContent: replyData?.body?.content || ''\n  }\n};"
+      },
+      "id": "node-3-merge",
+      "name": "Build Context Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1450, 300],
+      "notes": "Combines original message (if reply) with current user question into contextText."
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.microsoft.com/v1.0/teams/{{ $json.teamId }}/channels/{{ $json.channelId }}/messages/{{ $json.messageId }}/sendTyping",
+        "method": "POST",
+        "authentication": "oAuth2",
+        "sendBody": false,
+        "options": {}
+      },
+      "id": "node-4",
+      "name": "Send Typing Indicator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1450, 300],
+      "credentials": {
+        "microsoftOAuth2Api": {
+          "id": "microsoft-graph-api",
+          "name": "Microsoft Graph API"
+        }
+      },
+      "notes": "Sends typing indicator to Teams using Graph API. This shows users that the bot is processing their message."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare prompt selection context for AI Agent\nconst contextData = $input.item.json;\n\n// List of available custom prompts (can be loaded from API or config)\nconst availablePrompts = [\n  {\n    name: 'hr_leave_policy_faq',\n    description: 'HR leave policy, vacation requests, holidays, time off',\n    keywords: ['leave', 'vacation', 'holiday', 'time off', 'PTO', 'sick leave', 'annual leave']\n  },\n  {\n    name: 'b2c_booking_support',\n    description: 'Customer booking inquiries, cancellations, modifications, reservations',\n    keywords: ['booking', 'reservation', 'cancel', 'modify', 'room', 'hotel', 'check-in', 'check-out']\n  },\n  {\n    name: 'devops_ci_cd_helper',\n    description: 'CI/CD pipelines, deployment, infrastructure, DevOps technical questions',\n    keywords: ['deploy', 'pipeline', 'CI/CD', 'infrastructure', 'docker', 'kubernetes', 'devops']\n  },\n  {\n    name: 'company_general_info',\n    description: 'Company policies, office locations, general company information',\n    keywords: ['company', 'office', 'location', 'policy', 'general info', 'about']\n  }\n];\n\n// Build prompt selection instruction for AI Agent\nconst promptSelectionPrompt = `You are a prompt selection assistant. Analyze the user's question and determine which specialized prompt should be used, or if a generic prompt is more appropriate.\n\nAvailable custom prompts:\n${availablePrompts.map(p => `- ${p.name}: ${p.description} (keywords: ${p.keywords.join(', ')})\n`).join('')}\n\nInstructions:\n1. Analyze the user's question carefully\n2. Determine if it matches any of the custom prompts above\n3. If it matches, respond with JSON: {\"matched\": true, \"name_prompt\": \"prompt_name\", \"reason\": \"brief explanation\"}\n4. If it doesn't match any custom prompt, respond with JSON: {\"matched\": false, \"reason\": \"brief explanation\"}\n\nUser question:\n${contextData.contextText}\n\nRespond ONLY with valid JSON, no additional text.`;\n\nreturn {\n  json: {\n    ...contextData,\n    promptSelectionPrompt,\n    availablePrompts\n  }\n};"
+      },
+      "id": "node-5-prepare",
+      "name": "Prepare Prompt Selection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1650, 300],
+      "notes": "Prepares context and instructions for AI Agent to analyze and select the appropriate prompt."
+    },
+    {
+      "parameters": {
+        "model": "={{ $env.OPENAI_MODEL || 'gpt-4' }}",
+        "options": {
+          "systemMessage": "You are a prompt selection assistant. Analyze questions and determine the best prompt to use. Always respond with valid JSON only.",
+          "temperature": 0.3,
+          "maxTokens": 200
+        },
+        "promptType": "define",
+        "text": "={{ $json.promptSelectionPrompt }}",
+        "assignments": {
+          "assignments": []
+        }
+      },
+      "id": "node-5",
+      "name": "AI Agent - Select Prompt",
+      "type": "n8n-nodes-base.aiAgent",
+      "typeVersion": 1,
+      "position": [1850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credentials",
+          "name": "OpenAI API"
+        }
+      },
+      "notes": "AI Agent analyzes the user's question and intelligently selects the most appropriate prompt (custom or generic). This replaces the API-based matching with AI-powered decision making."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI Agent response and extract prompt selection\nconst aiResponse = $input.item.json;\nconst contextData = $('Build Context Text').item.json;\n\n// Extract response text from AI Agent\nlet responseText = '';\nif (aiResponse.output) {\n  responseText = typeof aiResponse.output === 'string' ? aiResponse.output : aiResponse.output.text || aiResponse.output.content || '';\n} else if (aiResponse.text) {\n  responseText = aiResponse.text;\n} else if (aiResponse.response) {\n  responseText = typeof aiResponse.response === 'string' ? aiResponse.response : aiResponse.response.text || '';\n}\n\n// Clean response (remove markdown code blocks if present)\nresponseText = responseText.replace(/```json\\n?/g, '').replace(/```\\n?/g, '').trim();\n\n// Parse JSON response\nlet promptDecision;\ntry {\n  promptDecision = JSON.parse(responseText);\n} catch (e) {\n  // If parsing fails, default to generic\n  console.error('Failed to parse AI response:', e);\n  promptDecision = { matched: false, reason: 'Failed to parse AI response' };\n}\n\n// Get available prompts from previous node\nconst availablePrompts = $('Prepare Prompt Selection').item.json.availablePrompts || [];\n\n// If matched, get the prompt details\nlet selectedPrompt = null;\nif (promptDecision.matched && promptDecision.name_prompt) {\n  selectedPrompt = availablePrompts.find(p => p.name === promptDecision.name_prompt);\n}\n\nreturn {\n  json: {\n    ...contextData,\n    matched: promptDecision.matched || false,\n    name_prompt: promptDecision.name_prompt || null,\n    reason: promptDecision.reason || '',\n    selectedPrompt,\n    aiResponseText: responseText\n  }\n};"
+      },
+      "id": "node-5-parse",
+      "name": "Parse Prompt Selection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2050, 300],
+      "notes": "Parses AI Agent's JSON response and extracts the prompt selection decision."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.matched }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node-6",
+      "name": "Check Prompt Match",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2250, 300],
+      "notes": "Branches: if AI Agent determined a custom prompt matches, use custom prompt; otherwise use generic prompt."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node 7A: Prepare Custom Prompt\nconst promptResult = $input.item.json;\nconst contextData = $('Build Context Text').item.json;\n\n// Get prompt content based on selected prompt name\nconst promptTemplates = {\n  'hr_leave_policy_faq': `You are an HR assistant for Ohmyhotel. Answer questions about leave policies, vacation requests, holidays, and time off clearly and concisely. If you don't know the answer, direct users to contact HR directly. Be professional and helpful.`,\n  'b2c_booking_support': `You are a customer support agent for Ohmyhotel. Help users with booking inquiries, cancellations, modifications, and reservations. Be friendly, solution-oriented, and provide clear instructions. If you cannot resolve the issue, direct them to customer support.`,\n  'devops_ci_cd_helper': `You are a technical assistant for DevOps at Ohmyhotel. Answer questions about CI/CD pipelines, deployment, infrastructure, Docker, Kubernetes, and related technical topics. Be precise and technical. If you don't know the answer, suggest consulting the DevOps team.`,\n  'company_general_info': `You are a company information assistant for Ohmyhotel. Answer questions about company policies, office locations, general company information, and FAQs. Be informative and concise. If you don't know the answer, direct users to the appropriate department.`\n};\n\nconst promptName = promptResult.name_prompt || 'custom';\nconst systemPrompt = promptTemplates[promptName] || promptTemplates['company_general_info'];\nconst userMessage = contextData.contextText;\n\nreturn {\n  json: {\n    ...contextData,\n    systemPrompt,\n    userMessage,\n    promptName,\n    promptType: 'custom',\n    reason: promptResult.reason || ''\n  }\n};"
+      },
+      "id": "node-7a",
+      "name": "Prepare Custom Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2450, 200],
+      "notes": "Prepares AI Agent request with custom system prompt based on AI's prompt selection. Prompt templates are stored in the workflow."
+    },
+    {
+      "parameters": {
+        "model": "={{ $env.OPENAI_MODEL || 'gpt-4' }}",
+        "options": {
+          "systemMessage": "={{ $json.systemPrompt }}",
+          "temperature": 0.7,
+          "maxTokens": 1000
+        },
+        "promptType": "define",
+        "text": "={{ $json.userMessage }}",
+        "assignments": {
+          "assignments": []
+        }
+      },
+      "id": "node-8a",
+      "name": "AI Agent (Custom)",
+      "type": "n8n-nodes-base.aiAgent",
+      "typeVersion": 1,
+      "position": [2650, 200],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credentials",
+          "name": "OpenAI API"
+        }
+      },
+      "notes": "Uses n8n AI Agent with custom system prompt. AI Agent provides enhanced capabilities like tool calling and better context handling."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node 7B: Prepare Generic Prompt\nconst contextData = $('Build Context Text').item.json;\n\nconst systemPrompt = `You are a helpful assistant for Ohmyhotel internal communication. Answer users' questions clearly and concisely. If you don't know the answer, politely say so and suggest they contact the relevant department (HR, IT, etc.). Keep responses professional and friendly.`;\n\nconst userMessage = contextData.contextText;\n\nreturn {\n  json: {\n    ...contextData,\n    systemPrompt,\n    userMessage,\n    promptName: 'generic',\n    promptType: 'generic'\n  }\n};"
+      },
+      "id": "node-7b",
+      "name": "Prepare Generic Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2450, 400],
+      "notes": "Prepares ChatGPT request with generic system prompt for general Q&A."
+    },
+    {
+      "parameters": {
+        "model": "={{ $env.OPENAI_MODEL || 'gpt-4' }}",
+        "options": {
+          "systemMessage": "={{ $json.systemPrompt }}",
+          "temperature": 0.7,
+          "maxTokens": 1000
+        },
+        "promptType": "define",
+        "text": "={{ $json.userMessage }}",
+        "assignments": {
+          "assignments": []
+        }
+      },
+      "id": "node-8b",
+      "name": "AI Agent (Generic)",
+      "type": "n8n-nodes-base.aiAgent",
+      "typeVersion": 1,
+      "position": [2650, 400],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credentials",
+          "name": "OpenAI API"
+        }
+      },
+      "notes": "Uses n8n AI Agent with generic system prompt. AI Agent provides enhanced capabilities like tool calling and better context handling."
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll"
+      },
+      "id": "node-9",
+      "name": "Merge Results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2.1,
+      "position": [2850, 300],
+      "notes": "Merges output from both custom and generic prompt branches. Only one branch will have data."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node 10: Format Teams Message\nconst aiResponse = $input.item.json;\nconst contextData = $('Build Context Text').item.json;\n\n// Extract answer from AI Agent response (n8n AI Agent format)\nlet finalAnswer = '';\n\n// AI Agent node typically returns output in 'output' field or directly as text\nif (aiResponse.output) {\n  finalAnswer = typeof aiResponse.output === 'string' ? aiResponse.output : aiResponse.output.text || aiResponse.output.content || '';\n} else if (aiResponse.text) {\n  finalAnswer = aiResponse.text;\n} else if (aiResponse.response) {\n  finalAnswer = typeof aiResponse.response === 'string' ? aiResponse.response : aiResponse.response.text || aiResponse.response.content || '';\n} else if (aiResponse.choices && aiResponse.choices[0]) {\n  // Fallback for OpenAI Chat format (backward compatibility)\n  finalAnswer = aiResponse.choices[0].message?.content || aiResponse.message?.content || '';\n} else if (aiResponse.content) {\n  finalAnswer = aiResponse.content;\n} else if (typeof aiResponse === 'string') {\n  finalAnswer = aiResponse;\n}\n\n// Ensure we have a valid answer\nif (!finalAnswer || finalAnswer.trim() === '') {\n  finalAnswer = 'I apologize, but I was unable to generate a response. Please try again.';\n}\n\n// Format Teams message with mention\nconst userId = contextData.userId;\nconst userName = contextData.userName;\n\n// Teams message format with mention\nconst teamsMessage = {\n  body: {\n    contentType: 'html',\n    content: `<at id=\"${userId}\">${userName}</at>\\n\\n${finalAnswer}`\n  },\n  mentions: [\n    {\n      id: userId,\n      mentionText: userName,\n      mentioned: {\n        id: userId,\n        displayName: userName\n      }\n    }\n  ]\n};\n\nreturn {\n  json: {\n    ...contextData,\n    finalAnswer,\n    teamsMessage,\n    promptName: contextData.promptName || 'generic',\n    promptType: contextData.promptType || 'generic'\n  }\n};"
+      },
+      "id": "node-10",
+      "name": "Format Teams Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3050, 300],
+      "notes": "Formats the AI response into Teams message format with user mention."
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.microsoft.com/v1.0/teams/{{ $json.teamId }}/channels/{{ $json.channelId }}/messages",
+        "method": "POST",
+        "authentication": "oAuth2",
+        "sendBody": true,
+        "contentType": "json",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={{ $json.teamsMessage.body }}"
+            },
+            {
+              "name": "mentions",
+              "value": "={{ $json.teamsMessage.mentions }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-11",
+      "name": "Send Reply to Teams",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3250, 300],
+      "credentials": {
+        "microsoftOAuth2Api": {
+          "id": "microsoft-graph-api",
+          "name": "Microsoft Graph API"
+        }
+      },
+      "notes": "Sends formatted reply message back to Teams in the same thread/conversation."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.LOGGING_API_URL || 'https://your-logging-api.com/log' }}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "timestamp",
+              "value": "={{ $now }}"
+            },
+            {
+              "name": "userId",
+              "value": "={{ $json.userId }}"
+            },
+            {
+              "name": "userName",
+              "value": "={{ $json.userName }}"
+            },
+            {
+              "name": "contextText",
+              "value": "={{ $json.contextText }}"
+            },
+            {
+              "name": "promptUsed",
+              "value": "={{ $json.promptName }}"
+            },
+            {
+              "name": "promptType",
+              "value": "={{ $json.promptType }}"
+            },
+            {
+              "name": "answerLength",
+              "value": "={{ $json.finalAnswer.length }}"
+            },
+            {
+              "name": "modelName",
+              "value": "={{ $env.OPENAI_MODEL || 'gpt-4' }}"
+            },
+            {
+              "name": "promptSelectionReason",
+              "value": "={{ $json.reason || null }}"
+            },
+            {
+              "name": "aiSelectionUsed",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-12",
+      "name": "Log Interaction",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3450, 300],
+      "notes": "Logs interaction details for monitoring, debugging, and analytics."
+    }
+  ],
+  "connections": {
+    "HTTP Trigger - Graph API Notification": {
+      "main": [
+        [
+          {
+            "node": "Validate & Extract Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Extract Notification": {
+      "main": [
+        [
+          {
+            "node": "Check Validation Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Validation Request": {
+      "main": [
+        [
+          {
+            "node": "Return Validation Token",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch Message from Graph API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Message from Graph API": {
+      "main": [
+        [
+          {
+            "node": "Detect Mention & Preprocess",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Mention & Preprocess": {
+      "main": [
+        [
+          {
+            "node": "Check Has Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Has Reply": {
+      "main": [
+        [
+          {
+            "node": "Get Reply Context (Graph API)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Context Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Reply Context (Graph API)": {
+      "main": [
+        [
+          {
+            "node": "Build Context Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Context Text": {
+      "main": [
+        [
+          {
+            "node": "Send Typing Indicator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Typing Indicator": {
+      "main": [
+        [
+          {
+            "node": "Prepare Prompt Selection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Prompt Selection": {
+      "main": [
+        [
+          {
+            "node": "AI Agent - Select Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent - Select Prompt": {
+      "main": [
+        [
+          {
+            "node": "Parse Prompt Selection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Prompt Selection": {
+      "main": [
+        [
+          {
+            "node": "Check Prompt Match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Prompt Match": {
+      "main": [
+        [
+          {
+            "node": "Prepare Custom Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Generic Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Custom Prompt": {
+      "main": [
+        [
+          {
+            "node": "AI Agent (Custom)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent (Custom)": {
+      "main": [
+        [
+          {
+            "node": "Merge Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Generic Prompt": {
+      "main": [
+        [
+          {
+            "node": "AI Agent (Generic)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent (Generic)": {
+      "main": [
+        [
+          {
+            "node": "Merge Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Results": {
+      "main": [
+        [
+          {
+            "node": "Format Teams Message",
+            "type": "main",
+            "index": "0"
+          }
+        ]
+      ]
+    },
+    "Format Teams Message": {
+      "main": [
+        [
+          {
+            "node": "Send Reply to Teams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reply to Teams": {
+      "main": [
+        [
+          {
+            "node": "Log Interaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}
+

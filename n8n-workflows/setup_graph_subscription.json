@@ -1,0 +1,151 @@
+{
+  "name": "Setup Graph API Subscription for Teams",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "setup-subscription",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "node-1",
+      "name": "HTTP Trigger - Setup",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "setup-graph-subscription",
+      "notes": "Trigger this workflow manually to set up Graph API subscription for Teams messages. Call this endpoint once to create the subscription."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare subscription payload\nconst webhookUrl = $env.N8N_WEBHOOK_URL || 'https://your-n8n-instance.com/webhook/teams-notification';\n\n// Get webhook URL from the trigger node\nconst triggerNode = $('HTTP Trigger - Setup').item.json;\nconst baseUrl = triggerNode.headers?.['x-forwarded-proto'] ? \n  `${triggerNode.headers['x-forwarded-proto']}://${triggerNode.headers.host}` :\n  webhookUrl.split('/webhook')[0];\n\nconst notificationUrl = `${baseUrl}/webhook/teams-notification`;\n\n// Subscription configuration\nconst subscription = {\n  changeType: 'created',\n  notificationUrl: notificationUrl,\n  resource: '/teams/allMessages',\n  expirationDateTime: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(), // 3 days from now\n  clientState: 'teams-chatbot-subscription'\n};\n\nreturn {\n  json: subscription\n};"
+      },
+      "id": "node-2",
+      "name": "Prepare Subscription",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300],
+      "notes": "Prepares the subscription payload with webhook URL and expiration date. Graph API subscriptions expire after 3 days max."
+    },
+    {
+      "parameters": {
+        "url": "https://graph.microsoft.com/v1.0/subscriptions",
+        "method": "POST",
+        "authentication": "oAuth2",
+        "sendBody": true,
+        "contentType": "json",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "changeType",
+              "value": "={{ $json.changeType }}"
+            },
+            {
+              "name": "notificationUrl",
+              "value": "={{ $json.notificationUrl }}"
+            },
+            {
+              "name": "resource",
+              "value": "={{ $json.resource }}"
+            },
+            {
+              "name": "expirationDateTime",
+              "value": "={{ $json.expirationDateTime }}"
+            },
+            {
+              "name": "clientState",
+              "value": "={{ $json.clientState }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-3",
+      "name": "Create Graph API Subscription",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [650, 300],
+      "credentials": {
+        "microsoftOAuth2Api": {
+          "id": "microsoft-graph-api",
+          "name": "Microsoft Graph API"
+        }
+      },
+      "notes": "Creates a subscription in Microsoft Graph API to receive notifications when new messages are created in Teams. Requires Application permissions: Subscription.ReadWrite.All"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "responseBody": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "id": "node-4",
+      "name": "Return Subscription ID",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "notes": "Returns the subscription ID. Save this ID to renew the subscription before it expires (every 3 days)."
+    }
+  ],
+  "connections": {
+    "HTTP Trigger - Setup": {
+      "main": [
+        [
+          {
+            "node": "Prepare Subscription",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Subscription": {
+      "main": [
+        [
+          {
+            "node": "Create Graph API Subscription",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Graph API Subscription": {
+      "main": [
+        [
+          {
+            "node": "Return Subscription ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}
+
